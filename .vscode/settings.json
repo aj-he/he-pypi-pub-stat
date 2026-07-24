@@ -1,0 +1,10 @@
+{
+    "openInIntegratedBrowser.autoAssociateAsDefaultByExtension": {
+        "html": true,
+        "htm": true,
+        "svg": true,
+        "xml": true,
+        "xsl": true,
+        "pdf": true
+    }
+}
