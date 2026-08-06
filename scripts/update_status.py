@@ -16,6 +16,7 @@ from typing import Iterable
 from urllib import error, parse, request
 
 import tomllib
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.version import InvalidVersion, Version
 
 
@@ -26,6 +27,7 @@ ORG_URL_PATTERN = re.compile(r"https?://github\.com/HistoricEngland/[^\s)\]>'\"]
 PYPI_PROJECT_PATTERN = re.compile(r"https?://pypi\.org/project/([^/]+)/?", re.IGNORECASE)
 PYPI_BADGE_PATTERN = re.compile(r"(?:img\.shields\.io|badge\.fury\.io)/(?:pypi|py)/v/([^\s)\]>'\"]+)", re.IGNORECASE)
 SETUP_NAME_PATTERN = re.compile(r"name\s*=\s*[\"']([^\"']+)[\"']")
+INTERNAL_GITHUB_REPO_PATTERN = re.compile(r"github\.com[/:]HistoricEngland/([A-Za-z0-9._-]+?)(?:\.git)?(?:[/?#@]|$)", re.IGNORECASE)
 REPO_LINK_PATTERN_TEMPLATE = r'<h3[^>]*>\s*<a[^>]+href="/{org}/([^"/]+)"'
 RETRY_DELAYS = (1.0, 2.0, 4.0)
 DEFAULT_ORG = "HistoricEngland"
@@ -53,6 +55,24 @@ class PackageStatus:
     newer_prereleases: list[str]
     source_url: str
     source_label: str
+    source_repo_name: str
+    arches_version: str
+
+
+@dataclass(frozen=True)
+class RepoInspection:
+    repo: Repo
+    arches_version: str
+    dependencies: dict[str, str]
+    status: PackageStatus | None
+
+
+@dataclass(frozen=True)
+class DependencyUse:
+    consumer_name: str
+    consumer_url: str
+    requirement: str
+    is_package: bool
 
 
 class HttpClient:
@@ -317,10 +337,202 @@ def parse_releases(releases: dict) -> tuple[str, list[str]]:
     return latest_stable, [str(version) for version in newer_prereleases]
 
 
+def format_poetry_dependency_value(value: object) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        if isinstance(value.get("version"), str):
+            return value["version"]
+        details: list[str] = []
+        for key in ("git", "url", "path", "branch", "tag", "rev"):
+            key_value = value.get(key)
+            if isinstance(key_value, str) and key_value:
+                details.append(f"{key}={key_value}")
+        if details:
+            return ", ".join(details)
+    return None
+
+
+def extract_arches_version_from_pyproject(pyproject_text: str | None) -> str:
+    if not pyproject_text:
+        return "-"
+
+    try:
+        data = tomllib.loads(pyproject_text)
+    except tomllib.TOMLDecodeError:
+        return "-"
+
+    if not isinstance(data, dict):
+        return "-"
+
+    project = data.get("project")
+    if isinstance(project, dict):
+        dependencies = project.get("dependencies")
+        if isinstance(dependencies, list):
+            for dependency in dependencies:
+                if not isinstance(dependency, str):
+                    continue
+                try:
+                    requirement = Requirement(dependency)
+                except InvalidRequirement:
+                    continue
+                if normalize_name(requirement.name) == "arches":
+                    return dependency.strip()
+
+    tool = data.get("tool")
+    if isinstance(tool, dict):
+        poetry = tool.get("poetry")
+        if isinstance(poetry, dict):
+            poetry_dependencies = poetry.get("dependencies")
+            if isinstance(poetry_dependencies, dict):
+                for dependency_name, dependency_value in poetry_dependencies.items():
+                    if isinstance(dependency_name, str) and normalize_name(dependency_name) == "arches":
+                        return format_poetry_dependency_value(dependency_value) or "-"
+
+    return "-"
+
+
+def describe_requirement(requirement: Requirement) -> str:
+    if requirement.url:
+        detail = requirement.url
+    elif requirement.specifier:
+        detail = str(requirement.specifier)
+    else:
+        detail = "any"
+
+    if requirement.marker:
+        detail = f"{detail}; {requirement.marker}"
+    return detail
+
+
+def add_dependency(dependencies: dict[str, str], name: str, requirement_text: str) -> None:
+    dependencies.setdefault(normalize_name(name), requirement_text)
+
+
+def parse_requirement_text(requirement_text: str) -> Requirement | None:
+    try:
+        return Requirement(requirement_text)
+    except InvalidRequirement:
+        return None
+
+
+def infer_internal_repo_name(requirement_text: str) -> str | None:
+    match = INTERNAL_GITHUB_REPO_PATTERN.search(requirement_text)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def extract_dependencies_from_pyproject(pyproject_text: str | None) -> dict[str, str]:
+    if not pyproject_text:
+        return {}
+
+    try:
+        data = tomllib.loads(pyproject_text)
+    except tomllib.TOMLDecodeError:
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    dependencies: dict[str, str] = {}
+    project = data.get("project")
+    if isinstance(project, dict):
+        project_dependencies = project.get("dependencies")
+        if isinstance(project_dependencies, list):
+            for dependency in project_dependencies:
+                if not isinstance(dependency, str):
+                    continue
+                requirement = parse_requirement_text(dependency)
+                if requirement is None:
+                    continue
+                add_dependency(dependencies, requirement.name, describe_requirement(requirement))
+
+    tool = data.get("tool")
+    if isinstance(tool, dict):
+        poetry = tool.get("poetry")
+        if isinstance(poetry, dict):
+            poetry_dependencies = poetry.get("dependencies")
+            if isinstance(poetry_dependencies, dict):
+                for dependency_name, dependency_value in poetry_dependencies.items():
+                    if not isinstance(dependency_name, str) or normalize_name(dependency_name) == "python":
+                        continue
+                    dependency_text = format_poetry_dependency_value(dependency_value)
+                    if dependency_text:
+                        add_dependency(dependencies, dependency_name, dependency_text)
+
+    return dependencies
+
+
+def extract_dependencies_from_setup_cfg(setup_cfg_text: str | None) -> dict[str, str]:
+    if not setup_cfg_text:
+        return {}
+
+    parser = configparser.ConfigParser()
+    try:
+        parser.read_string(setup_cfg_text)
+    except configparser.Error:
+        return {}
+
+    if not parser.has_option("options", "install_requires"):
+        return {}
+
+    dependencies: dict[str, str] = {}
+    for raw_line in parser.get("options", "install_requires").splitlines():
+        dependency = raw_line.strip()
+        if not dependency:
+            continue
+        requirement = parse_requirement_text(dependency)
+        if requirement is not None:
+            add_dependency(dependencies, requirement.name, describe_requirement(requirement))
+            continue
+        internal_repo_name = infer_internal_repo_name(dependency)
+        if internal_repo_name:
+            add_dependency(dependencies, internal_repo_name, dependency)
+
+    return dependencies
+
+
+def extract_dependencies_from_requirements(requirements_text: str | None) -> dict[str, str]:
+    if not requirements_text:
+        return {}
+
+    dependencies: dict[str, str] = {}
+    for raw_line in requirements_text.splitlines():
+        dependency = raw_line.split("#", 1)[0].strip()
+        if not dependency or dependency.startswith(("-", "--")):
+            continue
+        requirement = parse_requirement_text(dependency)
+        if requirement is not None:
+            add_dependency(dependencies, requirement.name, describe_requirement(requirement))
+            continue
+        internal_repo_name = infer_internal_repo_name(dependency)
+        if internal_repo_name:
+            add_dependency(dependencies, internal_repo_name, dependency)
+
+    return dependencies
+
+
+def extract_dependencies(file_contents: dict[str, str]) -> dict[str, str]:
+    dependencies: dict[str, str] = {}
+    for extracted in (
+        extract_dependencies_from_pyproject(file_contents.get("pyproject.toml")),
+        extract_dependencies_from_setup_cfg(file_contents.get("setup.cfg")),
+        extract_dependencies_from_requirements(file_contents.get("requirements.txt")),
+        extract_dependencies_from_requirements(file_contents.get("requirements-dev.txt")),
+        extract_dependencies_from_requirements(file_contents.get("requirements_dev.txt")),
+        extract_dependencies_from_requirements(file_contents.get("dev-requirements.txt")),
+    ):
+        for dependency_name, requirement_text in extracted.items():
+            dependencies.setdefault(dependency_name, requirement_text)
+    return dependencies
+
+
 def resolve_package_status(
     client: HttpClient,
     repo: Repo,
     candidates: Iterable[Candidate],
+    arches_version: str,
     verbose: bool,
 ) -> PackageStatus | None:
     for candidate in candidates:
@@ -358,34 +570,210 @@ def resolve_package_status(
                 newer_prereleases=newer_prereleases,
                 source_url=source_url,
                 source_label=source_label,
+                source_repo_name=repo.name,
+                arches_version=arches_version,
             )
 
     return None
 
 
-def render_markdown(org: str, packages: list[PackageStatus], skipped: int, errors: list[str]) -> str:
+def format_consumer_links(consumers: list[DependencyUse]) -> str:
+    if not consumers:
+        return "-"
+
+    return ", ".join(
+        f"[{consumer.consumer_name}]({consumer.consumer_url}) ({consumer.requirement})"
+        for consumer in consumers
+    )
+
+
+def build_dependency_uses(
+    packages: list[PackageStatus], inspections: list[RepoInspection]
+) -> dict[str, list[DependencyUse]]:
+    package_names = {normalize_name(package.name) for package in packages}
+    package_repo_names = {package.source_repo_name for package in packages}
+    dependency_uses: dict[str, list[DependencyUse]] = {normalize_name(package.name): [] for package in packages}
+
+    for inspection in inspections:
+        is_package = inspection.repo.name in package_repo_names
+        consumer_name = inspection.status.name if inspection.status is not None else inspection.repo.name
+        for dependency_name, requirement_text in sorted(inspection.dependencies.items()):
+            if dependency_name not in package_names:
+                continue
+            dependency_uses[dependency_name].append(
+                DependencyUse(
+                    consumer_name=consumer_name,
+                    consumer_url=inspection.repo.html_url,
+                    requirement=requirement_text,
+                    is_package=is_package,
+                )
+            )
+
+    for dependency_name, consumers in dependency_uses.items():
+        dependency_uses[dependency_name] = sorted(
+            consumers,
+            key=lambda item: (item.is_package, item.consumer_name.lower(), item.requirement),
+        )
+
+    return dependency_uses
+
+
+def make_mermaid_id(prefix: str, label: str) -> str:
+    sanitized = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_") or "node"
+    return f"{prefix}_{sanitized}"
+
+
+def escape_mermaid_label(label: str) -> str:
+    return label.replace('"', "'")
+
+
+def render_dependency_graph(packages: list[PackageStatus], inspections: list[RepoInspection]) -> str | None:
+    package_by_name = {normalize_name(package.name): package for package in packages}
+    package_repo_names = {package.source_repo_name for package in packages}
+    package_by_repo = {package.source_repo_name: package for package in packages}
+    internal_by_dependency_name: dict[str, tuple[str, str]] = {}
+    for inspection in inspections:
+        internal_by_dependency_name.setdefault(normalize_name(inspection.repo.name), (inspection.repo.name, "component"))
+        internal_by_dependency_name.setdefault(
+            normalize_name(inspection.repo.name.replace("-", "_")),
+            (inspection.repo.name, "component"),
+        )
+        internal_by_dependency_name.setdefault(
+            normalize_name(inspection.repo.name.replace("_", "-")),
+            (inspection.repo.name, "component"),
+        )
+        if inspection.status is not None:
+            package = inspection.status
+            internal_by_dependency_name.setdefault(normalize_name(package.name), (package.name, "package"))
+    edges: list[tuple[str, str, str]] = []
+    node_labels: dict[str, str] = {}
+    node_classes: dict[str, str] = {}
+
+    # Always include confirmed PyPI packages, even if they are not connected.
+    for package in packages:
+        package_id = make_mermaid_id("pkg", package.name)
+        node_labels.setdefault(package_id, package.name)
+        node_classes[package_id] = "package"
+
+    for inspection in inspections:
+        consumer_is_package = inspection.repo.name in package_repo_names
+        consumer_label = inspection.status.name if inspection.status is not None else inspection.repo.name
+        consumer_id = make_mermaid_id("pkg" if consumer_is_package else "app", consumer_label)
+
+        for dependency_name, requirement_text in sorted(inspection.dependencies.items()):
+            target_label: str | None = None
+            target_class: str | None = None
+            package = package_by_name.get(dependency_name)
+            if package is not None:
+                target_label = package.name
+                target_class = "package"
+            else:
+                internal_target = internal_by_dependency_name.get(dependency_name)
+                if internal_target is None:
+                    internal_repo_name = infer_internal_repo_name(requirement_text)
+                    if internal_repo_name:
+                        internal_target = internal_by_dependency_name.get(normalize_name(internal_repo_name))
+                if internal_target is not None:
+                    target_label = internal_target[0]
+                    target_class = internal_target[1]
+
+            if target_label is None or target_class is None:
+                continue
+
+            target_id = make_mermaid_id("pkg" if target_class == "package" else "cmp", target_label)
+            if consumer_id == target_id:
+                continue
+
+            node_labels.setdefault(consumer_id, consumer_label)
+            node_classes[consumer_id] = "package" if consumer_is_package else "application"
+            node_labels.setdefault(target_id, target_label)
+            node_classes[target_id] = target_class
+            edges.append((consumer_id, target_id, requirement_text))
+
+    if not node_labels:
+        return None
+
+    package_ids = sorted(node_id for node_id, class_name in node_classes.items() if class_name == "package")
+    application_ids = sorted(node_id for node_id, class_name in node_classes.items() if class_name == "application")
+    component_ids = sorted(node_id for node_id, class_name in node_classes.items() if class_name == "component")
+
+    if edges:
+        connected_ids: set[str] = set()
+        for source_id, target_id, _ in edges:
+            connected_ids.add(source_id)
+            connected_ids.add(target_id)
+        # Keep all packages, but prune unconnected applications/components.
+        keep_ids = connected_ids | set(package_ids)
+        node_labels = {node_id: label for node_id, label in node_labels.items() if node_id in keep_ids}
+        node_classes = {node_id: class_name for node_id, class_name in node_classes.items() if node_id in keep_ids}
+        package_ids = sorted(node_id for node_id, class_name in node_classes.items() if class_name == "package")
+        application_ids = sorted(node_id for node_id, class_name in node_classes.items() if class_name == "application")
+        component_ids = sorted(node_id for node_id, class_name in node_classes.items() if class_name == "component")
+    else:
+        # No edges: only render standalone package nodes.
+        node_labels = {node_id: label for node_id, label in node_labels.items() if node_classes.get(node_id) == "package"}
+        node_classes = {node_id: class_name for node_id, class_name in node_classes.items() if class_name == "package"}
+        package_ids = sorted(node_labels.keys())
+        application_ids = []
+        component_ids = []
+
+    lines = ["```mermaid", "flowchart LR"]
+    for node_id in sorted(node_labels):
+        lines.append(f'  {node_id}["{escape_mermaid_label(node_labels[node_id])}"]')
+    for source_id, target_id, requirement_text in edges:
+        lines.append(f'  {source_id} -->|"{escape_mermaid_label(requirement_text)}"| {target_id}')
+    lines.append("  classDef package fill:#e8f0ff,stroke:#3766b1,color:#10223f;")
+    lines.append("  classDef application fill:#edf8ec,stroke:#467a49,color:#18321a;")
+    lines.append("  classDef component fill:#fff6e5,stroke:#a06a00,color:#3f2a00;")
+    if package_ids:
+        lines.append(f"  class {','.join(package_ids)} package;")
+    if application_ids:
+        lines.append(f"  class {','.join(application_ids)} application;")
+    if component_ids:
+        lines.append(f"  class {','.join(component_ids)} component;")
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def render_markdown(
+    org: str,
+    packages: list[PackageStatus],
+    dependency_uses: dict[str, list[DependencyUse]],
+    dependency_graph: str | None,
+    skipped: int,
+    errors: list[str],
+) -> str:
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    application_dependency_count = sum(
+        1
+        for consumers in dependency_uses.values()
+        if any(not consumer.is_package for consumer in consumers)
+    )
+    internal_edge_count = sum(len(consumers) for consumers in dependency_uses.values())
     lines = [
         f"# {org} PyPI Status",
         "",
         f"Packages published on PyPI whose project metadata points to the {org} GitHub organisation.",
         "",
-        "| Package | Latest stable | Newer prereleases | Source |",
-        "| --- | --- | --- | --- |",
+        "| Package | Latest stable | Newer prereleases | Arches (pyproject) | Applications using package | Source |",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
 
     for package in packages:
         prereleases = ", ".join(package.newer_prereleases) if package.newer_prereleases else "-"
+        applications = [consumer for consumer in dependency_uses.get(normalize_name(package.name), []) if not consumer.is_package]
         lines.append(
             "| "
             f"[{package.name}]({package.project_url}) | "
             f"{package.latest_stable} | "
             f"{prereleases} | "
+            f"{package.arches_version} | "
+            f"{format_consumer_links(applications)} | "
             f"[{package.source_label}]({package.source_url}) |"
         )
 
     if not packages:
-        lines.append("| - | - | - | - |")
+        lines.append("| - | - | - | - | - | - |")
 
     lines.extend(
         [
@@ -393,10 +781,15 @@ def render_markdown(org: str, packages: list[PackageStatus], skipped: int, error
             f"Generated: {generated_at}",
             "",
             f"Confirmed packages: {len(packages)}",
+            f"Packages used by at least one application: {application_dependency_count}",
+            f"Internal dependency edges found: {internal_edge_count}",
             f"Repositories without a confirmed PyPI package: {skipped}",
             f"Errors: {len(errors)}",
         ]
     )
+
+    if dependency_graph:
+        lines.extend(["", "## Dependency graph", "", dependency_graph])
 
     if errors:
         lines.extend(["", "## Errors", ""])
@@ -420,8 +813,20 @@ def main() -> int:
         return 1
 
     packages: list[PackageStatus] = []
+    inspections: list[RepoInspection] = []
     skipped = 0
-    packaging_files = ("pyproject.toml", "setup.cfg", "setup.py", "README.md", "README.rst", "readme.md")
+    packaging_files = (
+        "pyproject.toml",
+        "setup.cfg",
+        "setup.py",
+        "README.md",
+        "README.rst",
+        "readme.md",
+        "requirements.txt",
+        "requirements-dev.txt",
+        "requirements_dev.txt",
+        "dev-requirements.txt",
+    )
 
     for repo in repos:
         if args.verbose:
@@ -440,12 +845,23 @@ def main() -> int:
             continue
 
         candidates = extract_candidates(repo, file_contents)
+        arches_version = extract_arches_version_from_pyproject(file_contents.get("pyproject.toml"))
+        dependencies = extract_dependencies(file_contents)
         try:
-            status = resolve_package_status(client, repo, candidates, args.verbose)
+            status = resolve_package_status(client, repo, candidates, arches_version, args.verbose)
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{repo.name}: failed to resolve PyPI package ({exc})")
             skipped += 1
             continue
+
+        inspections.append(
+            RepoInspection(
+                repo=repo,
+                arches_version=arches_version,
+                dependencies=dependencies,
+                status=status,
+            )
+        )
 
         if status is None:
             skipped += 1
@@ -458,7 +874,9 @@ def main() -> int:
         unique_packages.setdefault(normalize_name(package.name), package)
 
     packages = list(unique_packages.values())
-    markdown = render_markdown(args.org, packages, skipped, errors)
+    dependency_uses = build_dependency_uses(packages, inspections)
+    dependency_graph = render_dependency_graph(packages, inspections)
+    markdown = render_markdown(args.org, packages, dependency_uses, dependency_graph, skipped, errors)
     output_path.write_text(markdown, encoding="utf-8")
 
     print(f"Wrote {output_path}")

@@ -9,6 +9,7 @@ The generated `status.md` contains one row per confirmed package with these colu
 - Package name linked to the PyPI project page
 - Latest stable version published on PyPI
 - Any prerelease versions newer than the latest stable version
+- Arches dependency version/constraint found in the repository root `pyproject.toml` (if present)
 - Source repository link in the HistoricEngland GitHub organisation
 
 Packages are only included when the script can confirm both of these conditions:
